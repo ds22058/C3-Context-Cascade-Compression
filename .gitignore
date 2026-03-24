@@ -1,0 +1,24 @@
+# 大文件目录
+data/
+models/
+output/
+
+# 评估产物（数据可通过 download_eval_data.py 下载）
+eval/data/
+eval/logs/
+eval/results/
+eval/__pycache__/
+
+# 不需要追踪的文件
+C3.pdf
+Untitled
+tmp_summary.md
+
+# 通用
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
+*.swp
+*.swo
+.claude/

@@ -1,0 +1,10 @@
+# C3 Decoder 评估依赖
+# GPU 安装: pip install torch --index-url https://download.pytorch.org/whl/cu118
+# CPU 安装: pip install torch
+transformers==4.49.0
+safetensors>=0.4.0
+datasets>=2.18.0
+accelerate>=0.27.0
+lm-eval>=0.4.2
+huggingface_hub>=0.21.0
+tqdm>=4.66.0

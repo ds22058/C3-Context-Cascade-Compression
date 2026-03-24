@@ -1,0 +1,11 @@
+# C3 v2 Training Dependencies
+# Install PyTorch first: pip install torch --index-url https://download.pytorch.org/whl/cu118
+transformers>=4.49.0
+safetensors>=0.4.0
+datasets>=2.18.0
+accelerate>=0.27.0
+deepspeed>=0.14.0
+huggingface_hub>=0.21.0
+tqdm>=4.66.0
+wandb>=0.16.0
+tensorboard>=2.15.0

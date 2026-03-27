@@ -26,6 +26,11 @@ TASK_INFO = [
     ("winogrande",    "WinoGrande",    ["acc,none", "acc"]),
 ]
 
+TASK_INFO_V2 = TASK_INFO + [
+    ("race",          "RACE",          ["acc,none", "acc"]),
+    ("boolq",         "BoolQ",         ["acc,none", "acc"]),
+]
+
 
 DATASET_TOKEN_INFO = {
     "wikitext-2": "64-512 tok",
@@ -240,14 +245,32 @@ def section_lm_eval_compressed(models, results_dir):
     if not all_results:
         return ""
 
+    # 找 baseline 不压缩的标准 lm_eval 结果作为参照列
+    baseline_results = None
+    baseline_name = None
+    for m in models:
+        r = find_lm_eval_results(os.path.join(results_dir, m, "lm_eval"))
+        if r and m not in all_results:
+            baseline_results = r
+            baseline_name = f"{m} (不压缩)"
+            break
+
     thresholds = set(v["threshold"] for v in all_results.values())
     threshold_str = "/".join(str(t) for t in thresholds)
 
     lines = [f"## 4. Context-Compressed NLP 基准 (threshold={threshold_str})\n"]
-    headers = ["任务"] + [m for m in models if m in all_results]
+    col_names = []
+    if baseline_name:
+        col_names.append(baseline_name)
+    col_names.extend([m for m in models if m in all_results])
+    headers = ["任务"] + col_names
+
     rows = []
     for task_key, display_name, metric_keys in TASK_INFO:
         row = [display_name]
+        if baseline_results:
+            score = get_score(baseline_results, task_key, metric_keys)
+            row.append(f"{score*100:.2f}%" if score is not None else "N/A")
         for m in models:
             if m not in all_results:
                 continue
@@ -257,6 +280,131 @@ def section_lm_eval_compressed(models, results_dir):
 
     lines.append(make_md_table(headers, rows))
     lines.append("")
+    return "\n".join(lines)
+
+
+def section_lm_eval_compressed_v2(models, results_dir):
+    """v2 评估结果对比: MMLU (few-shot 压缩) + HotpotQA (段落压缩, 生成式 EM/F1)。"""
+    all_results = {}
+    all_meta = {}
+
+    for m in models:
+        v2_dir = os.path.join(results_dir, m, "lm_eval_compressed_v2")
+        merged_results = {}
+        merged_task_meta = {}
+        merged_meta = {}
+
+        old_file = os.path.join(v2_dir, "results_fewshot_compressed.json")
+        old_data = load_json(old_file)
+        if old_data and "results" in old_data:
+            merged_results.update(old_data["results"])
+            merged_meta = old_data.get("meta", {})
+            merged_task_meta.update(merged_meta.get("task_meta", {}))
+
+        if os.path.isdir(v2_dir):
+            for fname in sorted(os.listdir(v2_dir)):
+                if fname.startswith("v2_") and fname.endswith(".json"):
+                    data = load_json(os.path.join(v2_dir, fname))
+                    if data and "results" in data:
+                        merged_results.update(data["results"])
+                        if not merged_meta:
+                            merged_meta = data.get("meta", {})
+                        merged_task_meta.update(data.get("meta", {}).get("task_meta", {}))
+
+        if merged_results:
+            all_results[m] = merged_results
+            merged_meta["task_meta"] = merged_task_meta
+            all_meta[m] = merged_meta
+
+    if not all_results:
+        return ""
+
+    modes = set(m.get("mode", "?") for m in all_meta.values())
+    mode_str = "/".join(modes)
+
+    lines = [f"## 5. Context-Compressed NLP v2 (few-shot/段落压缩, 题干不压缩)\n"]
+    lines.append(f"> 模式: {mode_str}\n")
+
+    for m, meta in all_meta.items():
+        task_meta = meta.get("task_meta", {})
+        parts = []
+        for t, info in task_meta.items():
+            avg = info.get("avg_context_tokens")
+            n = info.get("num_samples")
+            seg = info.get("num_segments", 1)
+            if avg is not None:
+                parts.append(f"{t}: {avg}tok/{n}样本/seg={seg}")
+        if parts:
+            lines.append(f"> {m}: {', '.join(parts)}\n")
+
+    # MMLU: acc (logprob) — 两个版本
+    mmlu_info = [
+        ("mmlu",       "MMLU (few-shot压缩, 题干不压缩)", "acc"),
+        ("mmlu_cstem", "MMLU (few-shot+题干压缩, 选项不压缩)", "acc"),
+    ]
+    headers = ["任务"] + [m for m in models if m in all_results]
+    rows = []
+    for task_key, display_name, metric in mmlu_info:
+        row = [display_name]
+        for m in models:
+            if m not in all_results:
+                continue
+            task_data = all_results[m].get(task_key)
+            if task_data and metric in task_data:
+                row.append(f"{task_data[metric]*100:.2f}%")
+            else:
+                row.append("N/A")
+        if len(row) > 1:
+            rows.append(row)
+
+    if rows:
+        lines.append("### MMLU (logprob, acc)\n")
+        lines.append(make_md_table(headers, rows))
+        lines.append("")
+
+    # HotpotQA: em/f1 (generate) — 自动检测可用数据集
+    hotpotqa_candidates = [
+        ("hotpotqa_fewshot",       "HotpotQA (1-shot压缩, ~873tok)"),
+        ("hotpotqa_inst",          "HotpotQA (instruction, <1000tok)"),
+        ("hotpotqa_short_quarter", "HotpotQA (<1200tok, 采样1/4)"),
+        ("hotpotqa_short",         "HotpotQA (<1200tok)"),
+    ]
+    hotpotqa_info = []
+    for key, label in hotpotqa_candidates:
+        if any(key in all_results.get(m, {}) for m in models):
+            hotpotqa_info.append((key, label))
+    if not hotpotqa_info:
+        hotpotqa_info = [("hotpotqa_short", "HotpotQA (<1200tok)")]
+
+    hqa_headers = ["子集"] + [m for m in models if m in all_results]
+    hqa_rows_em, hqa_rows_f1 = [], []
+    for task_key, display_name in hotpotqa_info:
+        row_em = [display_name]
+        row_f1 = [display_name]
+        for m in models:
+            if m not in all_results:
+                continue
+            task_data = all_results[m].get(task_key)
+            if task_data:
+                em_val = task_data.get("em")
+                f1_val = task_data.get("f1")
+                row_em.append(f"{em_val*100:.2f}%" if em_val is not None else "N/A")
+                row_f1.append(f"{f1_val*100:.2f}%" if f1_val is not None else "N/A")
+            else:
+                row_em.append("N/A")
+                row_f1.append("N/A")
+        if len(row_em) > 1:
+            hqa_rows_em.append(row_em)
+            hqa_rows_f1.append(row_f1)
+
+    if hqa_rows_em:
+        lines.append("### HotpotQA (generate, EM)\n")
+        lines.append(make_md_table(hqa_headers, hqa_rows_em))
+        lines.append("")
+        lines.append("### HotpotQA (generate, F1)\n")
+        lines.append(make_md_table(hqa_headers, hqa_rows_f1))
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -315,7 +463,8 @@ def main():
         section_lm_eval(args.models, args.results_dir),
         section_reconstruction(args.models, args.results_dir),
         section_lm_eval_compressed(args.models, args.results_dir),
-        section_generation(args.models, args.results_dir),
+        section_lm_eval_compressed_v2(args.models, args.results_dir),
+        # section_generation(args.models, args.results_dir),  # 暂时注释
     ]
 
     report = "\n".join(s for s in sections if s)

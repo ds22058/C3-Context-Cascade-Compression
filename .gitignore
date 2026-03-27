@@ -22,3 +22,8 @@ __pycache__/
 *.swp
 *.swo
 .claude/
+
+# benchmark 数据（通过 download.py + prepare.py 生成）
+eval/benchmark_data/raw/
+eval/benchmark_data/processed/
+eval/benchmark_data/__pycache__/

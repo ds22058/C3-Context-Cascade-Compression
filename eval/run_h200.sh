@@ -18,6 +18,7 @@
 #   SKIP_PPL=1           跳过 Perplexity
 #   SKIP_GENERATION=1    跳过生成质量
 #   SKIP_COMPRESSED=1    跳过 compressed lm_eval
+#   SKIP_COMPRESSED_V2=1 跳过 compressed lm_eval v2 (few-shot 压缩)
 #
 # 示例：
 #   bash eval/run_h200.sh ./output/phase2  c3-phase2  0,1,2,3,4,5,6,7
@@ -45,6 +46,8 @@
 #           · PPL — N≥7 时 2 卡，否则 1 卡
 #   阶段 4  生成质量            — 1 卡
 #   阶段 5  compressed lm_eval — 全部 N 卡并行（仅 C3）
+#   阶段 6  compressed lm_eval v2 (few-shot 压缩) — C3: 全部 N 卡并行
+#                                                    CausalLM: 标准 lm_eval + 匹配 few-shot
 #
 # 标准 CausalLM 模型跳过阶段 1 和 5，其余照常。
 # 结果统一保存到 eval/results/<model_name>/
@@ -74,6 +77,7 @@ SKIP_LM_EVAL="${SKIP_LM_EVAL:-0}"
 SKIP_PPL="${SKIP_PPL:-0}"
 SKIP_GENERATION="${SKIP_GENERATION:-0}"
 SKIP_COMPRESSED="${SKIP_COMPRESSED:-0}"
+SKIP_COMPRESSED_V2="${SKIP_COMPRESSED_V2:-0}"
 
 IFS=',' read -ra GPUS <<< "$GPU_LIST"
 N=${#GPUS[@]}
@@ -131,7 +135,7 @@ GPUS_PPL=$(gpu_range $IDX $N_PPL)
 if [ -d "${MODEL_PATH}/llm1" ]; then
     MODEL_TYPE="c3"
     DECODER_PATH="${MODEL_PATH}_decoder_extracted"
-    STAGE_TOTAL=5
+    STAGE_TOTAL=6
 
     # 自动补全 modeling_C3.py（训练 checkpoint 目录通常不含此文件）
     if [ ! -f "${MODEL_PATH}/modeling_C3.py" ]; then
@@ -146,7 +150,7 @@ if [ -d "${MODEL_PATH}/llm1" ]; then
 else
     MODEL_TYPE="causal_lm"
     DECODER_PATH="$MODEL_PATH"
-    STAGE_TOTAL=3
+    STAGE_TOTAL=4
 fi
 
 step "评估: ${MODEL_NAME}  |  类型: ${MODEL_TYPE}  |  GPU: ${GPU_LIST} (${N}卡)"
@@ -163,7 +167,8 @@ SKIPPED=""
 [ "$SKIP_LM_EVAL" = "1" ]   && SKIPPED="${SKIPPED} lm_eval"
 [ "$SKIP_PPL" = "1" ]       && SKIPPED="${SKIPPED} ppl"
 [ "$SKIP_GENERATION" = "1" ] && SKIPPED="${SKIPPED} generation"
-[ "$SKIP_COMPRESSED" = "1" ] && SKIPPED="${SKIPPED} compressed"
+[ "$SKIP_COMPRESSED" = "1" ]    && SKIPPED="${SKIPPED} compressed"
+[ "$SKIP_COMPRESSED_V2" = "1" ] && SKIPPED="${SKIPPED} compressed_v2"
 if [ -n "$SKIPPED" ]; then
     echo -e "  ${YELLOW}跳过:${NC}${SKIPPED}"
 fi
@@ -364,24 +369,24 @@ else
 fi
 
 # ==============================================================
-# 阶段 4: 生成质量（1 卡）
+# 阶段 4: 生成质量（1 卡）— 暂时注释
 # ==============================================================
-if [ "$SKIP_GENERATION" != "1" ]; then
-    STAGE=$((STAGE + 1))
-    step "阶段 ${STAGE}/${STAGE_TOTAL}: 生成质量 (1卡 GPU ${GPUS[0]})"
-
-    CUDA_VISIBLE_DEVICES=${GPUS[0]} python eval/eval_generation.py \
-        --model_path  "$DECODER_PATH" \
-        --model_name  "$MODEL_NAME" \
-        --device      cuda \
-        --output      "${RESULTS_DIR}/generation.json" \
-        2>&1 | tee "${LOGDIR}/generation.log"
-    GEN_RC=${PIPESTATUS[0]}
-    if [ "$GEN_RC" -eq 0 ]; then ok "生成质量 ($(( SECONDS - T_START ))s)"
-    else fail "生成质量 → ${LOGDIR}/generation.log"; FAIL=1; fi
-else
-    skip "生成质量 (SKIP_GENERATION=1)"
-fi
+# if [ "$SKIP_GENERATION" != "1" ]; then
+#     STAGE=$((STAGE + 1))
+#     step "阶段 ${STAGE}/${STAGE_TOTAL}: 生成质量 (1卡 GPU ${GPUS[0]})"
+#
+#     CUDA_VISIBLE_DEVICES=${GPUS[0]} python eval/eval_generation.py \
+#         --model_path  "$DECODER_PATH" \
+#         --model_name  "$MODEL_NAME" \
+#         --device      cuda \
+#         --output      "${RESULTS_DIR}/generation.json" \
+#         2>&1 | tee "${LOGDIR}/generation.log"
+#     GEN_RC=${PIPESTATUS[0]}
+#     if [ "$GEN_RC" -eq 0 ]; then ok "生成质量 ($(( SECONDS - T_START ))s)"
+#     else fail "生成质量 → ${LOGDIR}/generation.log"; FAIL=1; fi
+# else
+#     skip "生成质量 (SKIP_GENERATION=1)"
+# fi
 
 # ==============================================================
 # 阶段 5: Context-Compressed lm_eval（仅 C3）
@@ -403,6 +408,55 @@ if [ "$MODEL_TYPE" = "c3" ] && [ "$SKIP_COMPRESSED" != "1" ]; then
     else fail "Compressed lm_eval → ${LOGDIR}/lm_eval_compressed.log"; FAIL=1; fi
 elif [ "$MODEL_TYPE" = "c3" ]; then
     skip "Compressed lm_eval (SKIP_COMPRESSED=1)"
+fi
+
+# ==============================================================
+# 阶段 6: Compressed Benchmark v2 (预处理数据 · 严格 600-1000 tok)
+#
+#   前置: eval/benchmark_data/processed/ 下需有预处理数据
+#         (运行 prepare.py 生成，每条样本 few-shot + 题干严格在 600-1000 tok)
+#
+#   C3 模型:     few-shot+题干 过 encoder 压缩, 选项不压缩
+#   CausalLM:    同样数据, 不压缩, 作为公平基线
+# ==============================================================
+
+V2_DATA_DIR="./eval/benchmark_data/processed"
+
+if [ "$SKIP_COMPRESSED_V2" != "1" ]; then
+    STAGE=$((STAGE + 1))
+
+    # 检查预处理数据
+    if [ ! -d "$V2_DATA_DIR" ] || [ -z "$(ls ${V2_DATA_DIR}/*.jsonl 2>/dev/null)" ]; then
+        warn "预处理数据不存在: ${V2_DATA_DIR}/"
+        warn "请先运行: python eval/benchmark_data/download.py && python eval/benchmark_data/prepare.py"
+        skip "Compressed Benchmark v2 (数据缺失)"
+    else
+        if [ "$MODEL_TYPE" = "c3" ]; then
+            step "阶段 ${STAGE}/${STAGE_TOTAL}: Compressed Benchmark v2 (C3 压缩, ${N}卡)"
+            CUDA_VISIBLE_DEVICES=${GPU_LIST} python eval/eval_lm_eval_compressed_v2.py \
+                --model_path  "$MODEL_PATH" \
+                --model_name  "$MODEL_NAME" \
+                --num_gpus    "$N" \
+                --data_dir    "$V2_DATA_DIR" \
+                --output_path "${RESULTS_DIR}/lm_eval_compressed_v2" \
+                2>&1 | tee "${LOGDIR}/lm_eval_compressed_v2.log"
+        else
+            step "阶段 ${STAGE}/${STAGE_TOTAL}: Compressed Benchmark v2 (基线, 不压缩, ${N}卡)"
+            CUDA_VISIBLE_DEVICES=${GPU_LIST} python eval/eval_lm_eval_compressed_v2.py \
+                --model_path  "$DECODER_PATH" \
+                --model_name  "$MODEL_NAME" \
+                --baseline \
+                --num_gpus    "$N" \
+                --data_dir    "$V2_DATA_DIR" \
+                --output_path "${RESULTS_DIR}/lm_eval_compressed_v2" \
+                2>&1 | tee "${LOGDIR}/lm_eval_compressed_v2.log"
+        fi
+        RC=${PIPESTATUS[0]}
+        if [ "$RC" -eq 0 ]; then ok "Compressed Benchmark v2 ($(( SECONDS - T_START ))s)"
+        else fail "Compressed Benchmark v2 → ${LOGDIR}/lm_eval_compressed_v2.log"; FAIL=1; fi
+    fi
+else
+    skip "Compressed Benchmark v2 (SKIP_COMPRESSED_V2=1)"
 fi
 
 set -e

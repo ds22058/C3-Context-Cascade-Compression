@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 class ModelArguments:
     c3_model_path: str = field(default="./models/c3")
     decoder_model_path: str = field(default="./models/qwen25-3b")
-    latent_token_len: int = field(default=32, metadata={"help": "32, 64, or 128"})
+    latent_token_len: int = field(default=512, metadata={"help": "Compressed latent token count (e.g. 32, 64, 128, 256, 512)"})
     reinit_projector: bool = field(default=False)
 
 
@@ -90,6 +90,7 @@ def load_model(model_args: ModelArguments, pipeline_args: TrainingPipelineArgume
             torch_dtype=dtype,
             use_safetensors=True,
             device_map=None,
+            attn_implementation="flash_attention_2",
         )
         return model
 
@@ -99,6 +100,7 @@ def load_model(model_args: ModelArguments, pipeline_args: TrainingPipelineArgume
         torch_dtype=dtype,
         use_safetensors=True,
         device_map=None,
+        attn_implementation="flash_attention_2",
     )
 
     logger.info(f"Loading fresh decoder from {model_args.decoder_model_path}")
@@ -107,6 +109,7 @@ def load_model(model_args: ModelArguments, pipeline_args: TrainingPipelineArgume
         torch_dtype=dtype,
         use_safetensors=True,
         device_map=None,
+        attn_implementation="flash_attention_2",
     )
 
     fresh_vocab_size = fresh_decoder.config.vocab_size
@@ -144,6 +147,20 @@ def load_model(model_args: ModelArguments, pipeline_args: TrainingPipelineArgume
     if model_args.reinit_projector:
         logger.info("Re-initializing mm_projector weights")
         model.model.mm_projector.reset_parameters()
+
+    old_latent_len = model.config.latent_token_len
+    new_latent_len = model_args.latent_token_len
+    if old_latent_len != new_latent_len:
+        logger.info(f"Resizing Q embeddings: {old_latent_len} → {new_latent_len}")
+        old_Q = model.model.Q
+        new_Q = torch.nn.Embedding(new_latent_len, old_Q.embedding_dim).to(dtype=old_Q.weight.dtype)
+        with torch.no_grad():
+            repeats = (new_latent_len + old_latent_len - 1) // old_latent_len
+            tiled = old_Q.weight.repeat(repeats, 1)[:new_latent_len]
+            new_Q.weight.copy_(tiled)
+        model.model.Q = new_Q
+        model.config.latent_token_len = new_latent_len
+        logger.info(f"Q init: tiled {old_latent_len} weights ×{repeats} → {new_latent_len}")
 
     return model
 

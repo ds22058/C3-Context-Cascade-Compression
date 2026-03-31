@@ -33,6 +33,16 @@ class C3V2Trainer(Trainer):
         super().__init__(**kwargs)
         self.decoder_lr_ratio = decoder_lr_ratio
 
+    def _get_train_sampler(self):
+        if self.args.group_by_length and hasattr(self.train_dataset, "lengths"):
+            from transformers.trainer_pt_utils import LengthGroupedSampler
+            return LengthGroupedSampler(
+                self.args.train_batch_size * self.args.gradient_accumulation_steps,
+                dataset=self.train_dataset,
+                lengths=self.train_dataset.lengths,
+            )
+        return super()._get_train_sampler()
+
     # ------------------------------------------------------------------
     # Custom loss: per-task metrics (reconstruct / continuation)
     # ------------------------------------------------------------------
@@ -71,6 +81,7 @@ class C3V2Trainer(Trainer):
 
                 recon_mask = task_types == 0
                 cont_mask = task_types == 1
+                instruct_mask = task_types == 2
 
                 metrics = {}
                 if recon_mask.any():
@@ -79,6 +90,9 @@ class C3V2Trainer(Trainer):
                 if cont_mask.any():
                     metrics["train/loss_continuation"] = per_sample_loss[cont_mask].mean().item()
                     metrics["train/count_continuation"] = int(cont_mask.sum().item())
+                if instruct_mask.any():
+                    metrics["train/loss_instruction"] = per_sample_loss[instruct_mask].mean().item()
+                    metrics["train/count_instruction"] = int(instruct_mask.sum().item())
 
                 valid_tokens = valid_mask.sum().item()
                 total_tokens = shift_labels.numel()

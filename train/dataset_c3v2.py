@@ -55,11 +55,25 @@ class C3V2Dataset(Dataset):
                 line = line.strip()
                 if line:
                     self.data.append(json.loads(line))
-        random.shuffle(self.data)
+        random.Random(42).shuffle(self.data)
         logging.warning(f"Loaded {len(self.data)} samples.")
 
     def __len__(self):
         return len(self.data)
+
+    @property
+    def lengths(self):
+        """Approximate lengths for LengthGroupedSampler (group_by_length=True)."""
+        if not hasattr(self, "_lengths"):
+            self._lengths = []
+            for item in self.data:
+                ctx_len = item.get("context_len", item.get("num_tokens", 1000))
+                if item.get("task") == "instruction":
+                    sr = item.get("split_ratio", 0.55)
+                    if sr > 0:
+                        ctx_len = int(ctx_len / sr)
+                self._lengths.append(ctx_len)
+        return self._lengths
 
     def _build_latent_placeholder(self) -> str:
         """Build the <img><imgpad>...<imgpad></img> placeholder string."""
@@ -77,6 +91,14 @@ class C3V2Dataset(Dataset):
             SYSTEM_MESSAGE + SEP_TOKEN
             + ROLE_USER + user_content + SEP_TOKEN
             + ROLE_ASSISTANT + target_text + SEP_TOKEN
+        )
+
+    def _build_instruction_conversation(self, context_text: str, response_text: str) -> str:
+        """Build conversation for instruction: full context in user message, no latent placeholder."""
+        return (
+            SYSTEM_MESSAGE + SEP_TOKEN
+            + ROLE_USER + context_text + SEP_TOKEN
+            + ROLE_ASSISTANT + response_text + SEP_TOKEN
         )
 
     def _build_context(self, context_text: str) -> str:
@@ -130,14 +152,24 @@ class C3V2Dataset(Dataset):
                 context_text, target_text = self._split_text_for_continuation(
                     text, split_ratio
                 )
-                prompt = ""
+                context_str = self._build_context(context_text)
+                conversation_str = self._build_conversation("", target_text)
+            elif task == "instruction":
+                split_ratio = item.get("split_ratio", 0.55)
+                context_text, target_text = self._split_text_for_continuation(
+                    text, split_ratio
+                )
+                context_str = self._build_context(context_text)
+                conversation_str = self._build_instruction_conversation(
+                    context_text, target_text
+                )
             else:
                 context_text = text
                 target_text = text
-                prompt = RECONSTRUCT_PROMPT
-
-            context_str = self._build_context(context_text)
-            conversation_str = self._build_conversation(prompt, target_text)
+                context_str = self._build_context(context_text)
+                conversation_str = self._build_conversation(
+                    RECONSTRUCT_PROMPT, target_text
+                )
 
             input_ids = self.tokenizer(
                 conversation_str,
@@ -157,14 +189,14 @@ class C3V2Dataset(Dataset):
 
             labels = self._mask_labels(input_ids, conversation_str)
 
-            if input_ids.shape[0] >= self.model_max_length:
+            if input_ids.shape[0] > self.model_max_length:
                 return self.__getitem__(random.randint(0, len(self.data) - 1))
 
             return dict(
                 input_ids=input_ids,
                 labels=labels,
                 context_ids=context_ids,
-                task_type=0 if task == "reconstruct" else 1,
+                task_type={"reconstruct": 0, "continuation": 1, "instruction": 2}.get(task, 0),
             )
 
         except Exception:

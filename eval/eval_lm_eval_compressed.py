@@ -3,9 +3,10 @@ Context-Compressed lm_eval：prompt 部分经过 C3 encoder 压缩后与剩余 t
 在 decoder 中预测下一个 token，模拟 context 压缩场景下的 NLP benchmark 评估。
 
 压缩策略（由 --compress_threshold 控制）：
-  · prompt tokens <= threshold: 全部过 encoder → 32 latent tokens → decoder
-  · prompt tokens >  threshold: 前 threshold 个 token 过 encoder → 32 latent tokens,
+  · prompt tokens <= threshold: 全部过 encoder → latent_token_len latent tokens → decoder
+  · prompt tokens >  threshold: 前 threshold 个 token 过 encoder → latent_token_len latent tokens,
                                  剩余 token 直接拼在 latent tokens 后面 → decoder
+  注意：compress_threshold 应 > latent_token_len，否则压缩后反而变长。
 
 需要 C3 完整模型（含 llm1 encoder），若无 encoder 权重则无法运行。
 支持多 GPU 并行（每卡加载独立模型，请求 round-robin 分发）。

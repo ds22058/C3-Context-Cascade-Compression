@@ -128,7 +128,7 @@ done
 # 单机: batch=4 × grad_accum=8 × 8gpu = 256
 # 四机: batch=4 × grad_accum=2 × 8gpu × 4node = 256 (保持 effective batch 一致)
 LATENT_TOKEN_LEN=512
-NUM_EPOCHS=${NUM_EPOCHS:-3}
+NUM_EPOCHS=${NUM_EPOCHS:-1}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
 BATCH_SIZE=4
 GRAD_ACCUM=2

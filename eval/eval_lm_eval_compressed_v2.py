@@ -5,11 +5,8 @@ Context-Compressed Benchmark v2
   logprob  — MMLU 等多选题，计算 continuation log-prob 选最优
   generate — HotpotQA 等生成式 QA，greedy decode 生成答案，EM/F1 评分
 
-多段压缩 (C3 模型):
-  num_segments=1: context → encoder → 32 latent
-  num_segments=2: context 对半分，各过 encoder → 64 latent
-  num_segments=3: context 三等分，各过 encoder → 96 latent
-  decoder 输入: [latent_1][latent_2]...[latent_N] + stem_text + continuation/generate
+C3 模型: context → encoder → latent_token_len latent → decoder
+  latent_token_len 从模型 config 自动读取（v2=32, v2.2=512）。
 
 用法：
     # C3
@@ -37,7 +34,6 @@ sys.path.insert(0, os.path.join(_eval_dir, ".."))
 import torch
 import torch.nn.functional as F
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
-from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
 DATA_DIR = os.path.join(_eval_dir, "benchmark_data", "processed")
 ALL_TASKS = ["mmlu", "mmlu_cstem", "hotpotqa_short", "hotpotqa_fewshot", "hotpotqa_inst"]
@@ -186,80 +182,6 @@ class C3Evaluator:
 
     def _encode(self, text):
         return self.tokenizer.encode(text, add_special_tokens=False)
-
-    # ── 多段 encoder ──────────────────────────────────────────
-
-    def _encode_segment(self, model, device, seg_ids):
-        """单段 context 过 encoder，返回 projected latent [latent_len, hidden]。"""
-        inner = model.get_model()
-        ctx_input = seg_ids + list(self._placeholder)
-        ctx_t = torch.tensor([ctx_input], device=device)
-        ctx_mask = torch.ones(1, len(ctx_input), device=device, dtype=torch.long)
-
-        ctx_embeds = inner.llm1.model.embed_tokens(ctx_t)
-        q_start = len(seg_ids) + 1
-        Q = inner.Q.weight.to(device=device, dtype=ctx_embeds.dtype)
-        ctx_embeds = ctx_embeds.clone()
-        ctx_embeds[0, q_start:q_start + self.latent_len] = Q
-
-        enc_out = inner.llm1.forward(
-            input_ids=None, attention_mask=ctx_mask,
-            inputs_embeds=ctx_embeds, output_hidden_states=True,
-            return_dict=True, use_cache=False,
-        )
-        hidden = enc_out["hidden_states"][-1]
-        latent = hidden[0, q_start:q_start + self.latent_len]
-        return inner.mm_projector(latent)
-
-    def _encode_multi(self, model, device, ctx_ids, num_segments):
-        """将 ctx_ids 等分为 num_segments 段，各过 encoder，返回 latent list。"""
-        seg_len = len(ctx_ids) // num_segments
-        latents = []
-        for i in range(num_segments):
-            start = i * seg_len
-            end = start + seg_len if i < num_segments - 1 else len(ctx_ids)
-            latent = self._encode_segment(model, device, ctx_ids[start:end])
-            latents.append(latent)
-        return latents
-
-    def _build_decoder_embeds(self, model, device, latents, suffix_ids):
-        """构建 decoder input_embeds: [latent_1][latent_2]...[suffix]。"""
-        inner = model.get_model()
-        parts = []
-        for latent in latents:
-            start_emb = inner.embed_tokens(torch.tensor([[self._placeholder[0]]], device=device))
-            end_emb = inner.embed_tokens(torch.tensor([[self._placeholder[-1]]], device=device))
-            parts.extend([start_emb, latent.unsqueeze(0), end_emb])
-        if suffix_ids:
-            suffix_emb = inner.embed_tokens(torch.tensor([suffix_ids], device=device))
-            parts.append(suffix_emb)
-        return torch.cat(parts, dim=1)
-
-    def _greedy_decode(self, model, device, input_embeds, max_new_tokens=50):
-        inner = model.get_model()
-        past_kv = None
-        generated = []
-        cur_embeds = input_embeds
-        attn_len = input_embeds.shape[1]
-
-        for _ in range(max_new_tokens):
-            attn_mask = torch.ones(1, attn_len, device=device, dtype=torch.long)
-            out = Qwen2Model.forward(
-                inner,
-                input_ids=None, inputs_embeds=cur_embeds,
-                attention_mask=attn_mask, past_key_values=past_kv,
-                use_cache=True, return_dict=True,
-            )
-            past_kv = out.past_key_values
-            logits = model.lm_head(out.last_hidden_state[:, -1:]).float()
-            next_id = logits.argmax(dim=-1).squeeze().item()
-            if next_id == self._eos_id:
-                break
-            generated.append(next_id)
-            cur_embeds = inner.embed_tokens(torch.tensor([[next_id]], device=device))
-            attn_len += 1
-
-        return generated
 
     # ── logprob 评测 (MMLU) ────────────────────────────────────
 
@@ -647,9 +569,8 @@ def main():
         eval_mode = samples[0].get("eval_mode", "logprob")
         toks = [s["context_tokens"] for s in samples]
         avg_t = sum(toks) / len(toks)
-        num_seg = samples[0].get("num_segments", 1)
         print(f"\n  ── {task_name}  ({len(samples)} 样本, avg={avg_t:.0f} tok, "
-              f"seg={num_seg}, mode={eval_mode})")
+              f"mode={eval_mode})")
 
         task_t0 = time.time()
         result = evaluator.evaluate(samples)
@@ -677,7 +598,6 @@ def main():
         all_meta[task_name] = {
             "num_samples": len(samples),
             "avg_context_tokens": round(avg_t, 1),
-            "num_segments": num_seg,
             "eval_mode": eval_mode,
             "elapsed_s": round(task_elapsed, 1),
         }

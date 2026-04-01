@@ -9,7 +9,17 @@
 #   model_path          模型路径
 #   model_name          模型名（结果目录名）
 #   gpu_list            逗号分隔的 GPU 编号（如 0,1,2,3,4,5,6,7）
-#   compress_threshold  compressed lm_eval 的 token 阈值（默认 256，仅 C3 模型使用）
+#   compress_threshold  compressed lm_eval 的 token 阈值（默认 1024，仅 C3 模型使用）
+#
+# 环境变量：
+#   RECON_DATASETS      重建测试数据集，逗号分隔，默认 "mixed-4k,mixed-8k"
+#                       可选值及对应上下文长度:
+#                         wikitext-2  — 64-512 tok (50 samples)
+#                         mixed-1k    — ~1024 tok  (20 samples)
+#                         mixed-2k    — ~2048 tok  (20 samples)
+#                         mixed-4k    — ~4096 tok  (20 samples)
+#                         mixed-8k    — ~8192 tok  (20 samples)
+#                       示例: RECON_DATASETS="mixed-1k,mixed-2k,mixed-4k,mixed-8k"
 #
 # 跳过阶段（通过环境变量控制，设为 1 则跳过）：
 #   SKIP_RECON_ENC=1    跳过重建(encoder)
@@ -24,13 +34,17 @@
 #   bash eval/run_h200.sh ./output/phase2  c3-phase2  0,1,2,3,4,5,6,7
 #   bash eval/run_h200.sh ./output/phase2  c3-phase2  0,1,2,3,4,5,6,7  512
 #
-#   # 只跑重建，跳过其他
+#   # 只跑重建(4k,8k)，跳过其他
 #   SKIP_LM_EVAL=1 SKIP_PPL=1 SKIP_GENERATION=1 SKIP_COMPRESSED=1 \
 #     bash eval/run_h200.sh ./output/phase1 c3-phase1 0,1,2,3,4,5,6,7
 #
-#   # Phase 1 评估（decoder 冻结，跳过不必要的项目）
-#   SKIP_RECON_DEC=1 SKIP_LM_EVAL=1 SKIP_PPL=1 SKIP_GENERATION=1 \
-#     bash eval/run_h200.sh ./output/phase1/checkpoint-20000 c3-p1 0,1,2,3,4,5,6,7
+#   # Phase 1 评估（只跑重建）
+#   SKIP_LM_EVAL=1 SKIP_PPL=1 SKIP_GENERATION=1 SKIP_COMPRESSED=1 SKIP_COMPRESSED_V2=1 \
+#     bash eval/run_h200.sh ./output/phase1_v22_4node c3-p1-v22 0,1,2,3,4,5,6,7
+#
+#   # 指定重建数据集
+#   RECON_DATASETS="wikitext-2,mixed-1k,mixed-2k,mixed-4k,mixed-8k" \
+#     bash eval/run_h200.sh ./output/phase2 c3-phase2 0,1,2,3,4,5,6,7
 #
 #   # 2 个模型同时评估
 #   bash eval/run_h200.sh ./output/phase1  c3-phase1  0,1,2,3 &
@@ -68,7 +82,7 @@ fi
 MODEL_PATH="${1:?用法: bash eval/run_h200.sh <model_path> <model_name> <gpu_list> [compress_threshold]}"
 MODEL_NAME="${2:?用法: bash eval/run_h200.sh <model_path> <model_name> <gpu_list> [compress_threshold]}"
 GPU_LIST="${3:?用法: bash eval/run_h200.sh <model_path> <model_name> <gpu_list> [compress_threshold]}"
-COMPRESS_THRESHOLD="${4:-256}"
+COMPRESS_THRESHOLD="${4:-1024}"
 
 # ── 跳过控制 ──────────────────────────────────────────────────
 SKIP_RECON_ENC="${SKIP_RECON_ENC:-0}"
@@ -78,6 +92,9 @@ SKIP_PPL="${SKIP_PPL:-0}"
 SKIP_GENERATION="${SKIP_GENERATION:-0}"
 SKIP_COMPRESSED="${SKIP_COMPRESSED:-0}"
 SKIP_COMPRESSED_V2="${SKIP_COMPRESSED_V2:-0}"
+
+# ── 重建测试数据集 ────────────────────────────────────────────
+RECON_DATASETS="${RECON_DATASETS:-mixed-4k,mixed-8k}"
 
 IFS=',' read -ra GPUS <<< "$GPU_LIST"
 N=${#GPUS[@]}
@@ -132,6 +149,17 @@ GPUS_PPL=$(gpu_range $IDX $N_PPL)
 # ── 模型类型检测 & Decoder 准备 ───────────────────────────────
 [ -d "${MODEL_PATH}" ] || { echo -e "${RED}模型路径不存在: ${MODEL_PATH}${NC}"; exit 1; }
 
+# 如果根目录没有 llm1，自动查找最新 checkpoint-*/llm1
+RESOLVED_MODEL_PATH="${MODEL_PATH}"
+if [ ! -d "${MODEL_PATH}/llm1" ]; then
+    LATEST_CKPT=$(ls -d "${MODEL_PATH}"/checkpoint-[0-9]* 2>/dev/null | grep -E 'checkpoint-[0-9]+$' | sort -t- -k2 -n | tail -1)
+    if [ -n "$LATEST_CKPT" ] && [ -d "${LATEST_CKPT}/llm1" ]; then
+        RESOLVED_MODEL_PATH="${LATEST_CKPT}"
+        warn "根目录无 llm1，自动使用最新 checkpoint: ${RESOLVED_MODEL_PATH}"
+    fi
+fi
+MODEL_PATH="${RESOLVED_MODEL_PATH}"
+
 if [ -d "${MODEL_PATH}/llm1" ]; then
     MODEL_TYPE="c3"
     DECODER_PATH="${MODEL_PATH}_decoder_extracted"
@@ -157,6 +185,7 @@ step "评估: ${MODEL_NAME}  |  类型: ${MODEL_TYPE}  |  GPU: ${GPU_LIST} (${N}
 echo "  模型路径:  ${MODEL_PATH}"
 [ "$MODEL_TYPE" = "c3" ] && echo "  Decoder:   ${DECODER_PATH}"
 [ "$MODEL_TYPE" = "c3" ] && echo "  压缩阈值:  ${COMPRESS_THRESHOLD} tokens"
+[ "$MODEL_TYPE" = "c3" ] && echo "  重建数据集: ${RECON_DATASETS}"
 echo "  结果目录:  ${RESULTS_DIR}"
 echo "  日志目录:  ${LOGDIR}"
 
@@ -205,12 +234,11 @@ if [ "$MODEL_TYPE" = "c3" ] && [ "$SKIP_RECON_ENC" != "1" ]; then
     STAGE=$((STAGE + 1))
     step "阶段 ${STAGE}/${STAGE_TOTAL}: 重建准确率 encoder（${N} 卡并行）"
 
-    # 需要 mixed-4k 时改为 "wikitext-2,mixed-1k,mixed-2k,mixed-4k"
     CUDA_VISIBLE_DEVICES=${GPU_LIST} python eval/eval_reconstruction.py \
         --model_path  "$MODEL_PATH" \
         --model_name  "$MODEL_NAME" \
         --num_gpus    "$N" \
-        --datasets    "wikitext-2,mixed-1k,mixed-2k" \
+        --datasets    "${RECON_DATASETS}" \
         --output      "${RESULTS_DIR}/reconstruction.json" \
         2>&1 | tee "${LOGDIR}/recon.log"
     RC=${PIPESTATUS[0]}

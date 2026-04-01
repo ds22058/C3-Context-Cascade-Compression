@@ -632,17 +632,23 @@ def _run_multi_gpu(num_gpus, model_path, dtype, all_work,
         all_dataset_results[ds_name] = avg
         _print_dataset_result(ds_name, avg)
 
+    existing = {}
+    if os.path.exists(output):
+        with open(output, encoding="utf-8") as f:
+            existing = json.load(f)
+    existing_ds = existing.get("datasets", {})
+    existing_ds.update(all_dataset_results)
     output_data = {
         "model_name": model_name,
         "model_path": model_path,
         "device": f"cuda x{num_gpus}",
         "dtype": str(dtype),
         "wall_time_s": round(wall_time, 1),
-        "datasets": all_dataset_results,
+        "datasets": existing_ds,
     }
     with open(output, "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2, ensure_ascii=False)
-    print(f"\n  → 结果已保存到 {output}")
+    print(f"\n  → 结果已保存到 {output}（已合并 {len(existing_ds)} 个数据集）")
 
     if save_samples and details_by_ds:
         samples_path = output.replace(".json", "_samples.json")
@@ -724,16 +730,22 @@ def _run_single(device, dtype, model_path, tokenizer, all_work,
         all_dataset_results[ds_name] = avg
         _print_dataset_result(ds_name, avg)
 
+        existing = {}
+        if os.path.exists(output):
+            with open(output, encoding="utf-8") as f:
+                existing = json.load(f)
+        existing_ds = existing.get("datasets", {})
+        existing_ds.update(all_dataset_results)
         output_data = {
             "model_name": model_name,
             "model_path": model_path,
             "device": str(device),
             "dtype": str(dtype),
-            "datasets": all_dataset_results,
+            "datasets": existing_ds,
         }
         with open(output, "w", encoding="utf-8") as f:
             json.dump(output_data, f, indent=2, ensure_ascii=False)
-        print(f"  → 已更新 {output}")
+        print(f"  → 已更新 {output}（已合并 {len(existing_ds)} 个数据集）")
 
     if save_samples and all_sample_details:
         samples_path = output.replace(".json", "_samples.json")
